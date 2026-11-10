@@ -102,7 +102,9 @@ Capabilities:
 
 **Determinism requirement:** Given the same event sequence, initial state, processing logic, and controlled dependencies, replay should produce the same logical outcome.
 
-External side effects must be isolated or simulated during replay. The system must not accidentally repeat real financial operations.
+External side effects must be isolated or simulated during replay. The system must not accidentally repeat real financial operations. Handlers receive their dependencies (clock, ID generation, effect sink) through interfaces, and the replay engine is only ever constructed with simulated implementations.
+
+The original execution outcome is stored as a baseline, so any replay can be compared against what actually happened and the first divergent event reported.
 
 ### 3.4 Idempotency Management
 
@@ -116,7 +118,7 @@ Capabilities:
 - Safe handling of repeated requests.
 - Atomic processing-state updates.
 
-Idempotency enforcement must account for concurrent requests rather than relying solely on an application-level existence check.
+Idempotency enforcement must account for concurrent requests rather than relying solely on an application-level existence check. It is enforced with database unique constraints and atomic inserts. Re-sending an event with the same ID and payload is a safe no-op; the same ID with a different payload is rejected with `409 Conflict`.
 
 ### 3.5 Out-of-Order Event Handling
 
@@ -140,6 +142,7 @@ Capabilities:
 - Resume interrupted replay sessions.
 - Track failed events.
 - Prevent duplicate effects during recovery.
+- Retry failed events under a controlled policy, with dead-letter handling when retries are exhausted.
 - Inspect replay progress.
 
 ### 3.7 Execution Debugging and Observability
@@ -192,6 +195,8 @@ This keeps the system straightforward to develop while maintaining clear boundar
              v             v             v
        Idempotency     Checkpoint     Execution
         Manager         Manager        Tracker
+          Ordering        Recovery
+          Manager         Manager
              |             |             |
              +-------------+-------------+
                            |
@@ -213,8 +218,10 @@ This keeps the system straightforward to develop while maintaining clear boundar
 | Event Store | Event history and metadata management |
 | Replay Engine | Event sequencing and replay execution |
 | Idempotency | Duplicate detection and processing guarantees |
-| Checkpoint | Replay progress and recovery |
-| Execution | Replay results, errors, and execution history |
+| Ordering | Sequence-gap detection and configurable out-of-order policies (`BUFFER`, `REJECT`, `FAIL_AND_FLAG`) |
+| Checkpoint | Replay progress, persisted atomically with the state it represents |
+| Recovery | Resuming interrupted sessions using lease-based ownership |
+| Execution | Original and replay results, errors, and execution history |
 | Observability | Structured logs and debugging information |
 
 ---
