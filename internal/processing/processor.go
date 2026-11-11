@@ -576,7 +576,12 @@ func (p *Processor) loadCommittedOutcome(ctx context.Context, tx pgx.Tx, ev even
 
 func (p *Processor) missingSequencesTx(ctx context.Context, tx pgx.Tx, txnID string, processedSeq int64) ([]int64, error) {
 	rows, err := tx.Query(ctx,
-		`SELECT sequence_number FROM events WHERE transaction_id = $1 AND sequence_number > $2`,
+		`SELECT e.sequence_number
+		   FROM events e
+		   JOIN event_processing ep ON ep.event_id = e.event_id
+		  WHERE e.transaction_id = $1
+		    AND e.sequence_number > $2
+		    AND ep.status IN ('PROCESSED', 'PROCESSING', 'PENDING_PREREQUISITE')`,
 		txnID, processedSeq)
 	if err != nil {
 		return nil, err

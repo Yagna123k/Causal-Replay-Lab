@@ -213,6 +213,7 @@ func (m *Manager) InspectTransaction(ctx context.Context, transactionID string) 
 	defer rows.Close()
 
 	var knownSeqs []int64
+	var activeSeqs []int64
 	st.Events = []EventState{}
 	for rows.Next() {
 		var es EventState
@@ -229,6 +230,9 @@ func (m *Manager) InspectTransaction(ctx context.Context, transactionID string) 
 		}
 		st.Events = append(st.Events, es)
 		knownSeqs = append(knownSeqs, es.SequenceNumber)
+		if es.Status == "PROCESSED" || es.Status == "PROCESSING" || es.Status == "PENDING_PREREQUISITE" {
+			activeSeqs = append(activeSeqs, es.SequenceNumber)
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return TransactionStatus{}, fmt.Errorf("iterate event states: %w", err)
@@ -256,10 +260,20 @@ func (m *Manager) InspectTransaction(ctx context.Context, transactionID string) 
 		return TransactionStatus{}, fmt.Errorf("iterate pending events: %w", err)
 	}
 
-	st.MissingSequences = FindMissingSequences(st.ProcessedSequence, knownSeqs)
-	if st.MissingSequences == nil {
-		st.MissingSequences = []int64{}
+	missingSet := map[int64]bool{}
+	for _, s := range FindMissingSequences(st.ProcessedSequence, knownSeqs) {
+		missingSet[s] = true
 	}
+	if len(st.PendingEvents) > 0 {
+		for _, s := range FindMissingSequences(st.ProcessedSequence, activeSeqs) {
+			missingSet[s] = true
+		}
+	}
+	st.MissingSequences = make([]int64, 0, len(missingSet))
+	for s := range missingSet {
+		st.MissingSequences = append(st.MissingSequences, s)
+	}
+	sort.Slice(st.MissingSequences, func(i, j int) bool { return st.MissingSequences[i] < st.MissingSequences[j] })
 	if len(st.MissingSequences) > 0 {
 		st.HasSequenceGap = true
 	}
