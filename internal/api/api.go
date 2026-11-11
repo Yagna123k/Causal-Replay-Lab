@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/Yagna123k/causal-replay-lab/internal/eventstore"
+	"github.com/Yagna123k/causal-replay-lab/internal/execution"
 	"github.com/Yagna123k/causal-replay-lab/internal/ingestion"
+	"github.com/Yagna123k/causal-replay-lab/internal/replay"
 )
 
 // Ingester ingests events.
@@ -26,6 +28,21 @@ type Reader interface {
 	ListByTransaction(ctx context.Context, transactionID string, afterSequence int64, limit int) ([]eventstore.Event, error)
 }
 
+// Replayer manages deterministic replay sessions and comparisons.
+type Replayer interface {
+	CreateSession(ctx context.Context, req replay.CreateRequest) (execution.Session, error)
+	StartSession(ctx context.Context, sessionID string) (replay.StartResult, error)
+	GetSession(ctx context.Context, sessionID string) (execution.Session, error)
+	ListExecutions(ctx context.Context, sessionID string) ([]execution.EventExecution, error)
+	Compare(ctx context.Context, leftID, rightID string) (execution.ComparisonResult, error)
+}
+
+// OriginalProcessor executes a transaction's events with live dependencies to
+// record the original baseline session.
+type OriginalProcessor interface {
+	ProcessOriginal(ctx context.Context, transactionID string) (execution.Session, error)
+}
+
 // Pinger checks dependency health.
 type Pinger interface {
 	Ping(ctx context.Context) error
@@ -35,6 +52,8 @@ type Pinger interface {
 type Deps struct {
 	Ingester       Ingester
 	Reader         Reader
+	Replayer       Replayer
+	Original       OriginalProcessor
 	Pinger         Pinger
 	Logger         *slog.Logger
 	RequestTimeout time.Duration
@@ -67,6 +86,12 @@ func NewHandler(d Deps) http.Handler {
 	mux.HandleFunc("POST /api/v1/events", s.ingestEvent)
 	mux.HandleFunc("GET /api/v1/events/{id}", s.getEvent)
 	mux.HandleFunc("GET /api/v1/transactions/{id}/events", s.listTransactionEvents)
+	mux.HandleFunc("POST /api/v1/transactions/{id}/process", s.processOriginal)
+	mux.HandleFunc("POST /api/v1/replays", s.createReplay)
+	mux.HandleFunc("POST /api/v1/replays/{id}/start", s.startReplay)
+	mux.HandleFunc("GET /api/v1/replays/{id}", s.getReplay)
+	mux.HandleFunc("GET /api/v1/replays/{id}/executions", s.listReplayExecutions)
+	mux.HandleFunc("GET /api/v1/replay-comparisons", s.compareReplays)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "route not found", nil)
 	})
@@ -174,18 +199,127 @@ func (s *server) listTransactionEvents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+func (s *server) processOriginal(w http.ResponseWriter, r *http.Request) {
+	if s.Original == nil {
+		writeError(w, http.StatusNotImplemented, "not_configured", "original processor is not configured", nil)
+		return
+	}
+	sess, err := s.Original.ProcessOriginal(r.Context(), r.PathValue("id"))
+	if err != nil {
+		if sess.SessionID == "" ||
+			errors.Is(err, eventstore.ErrNotFound) ||
+			errors.Is(err, execution.ErrInvalidSessionInput) {
+			s.handleError(w, r, err)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, sess)
+}
+
+func (s *server) createReplay(w http.ResponseWriter, r *http.Request) {
+	if s.Replayer == nil {
+		writeError(w, http.StatusNotImplemented, "not_configured", "replay engine is not configured", nil)
+		return
+	}
+	var req replay.CreateRequest
+	if !s.decodeBody(w, r, &req) {
+		return
+	}
+	sess, err := s.Replayer.CreateSession(r.Context(), req)
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, sess)
+}
+
+func (s *server) startReplay(w http.ResponseWriter, r *http.Request) {
+	if s.Replayer == nil {
+		writeError(w, http.StatusNotImplemented, "not_configured", "replay engine is not configured", nil)
+		return
+	}
+	res, err := s.Replayer.StartSession(r.Context(), r.PathValue("id"))
+	if err != nil {
+		if res.Session.SessionID == "" ||
+			errors.Is(err, execution.ErrSessionNotFound) ||
+			errors.Is(err, execution.ErrInvalidTransition) {
+			s.handleError(w, r, err)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *server) getReplay(w http.ResponseWriter, r *http.Request) {
+	if s.Replayer == nil {
+		writeError(w, http.StatusNotImplemented, "not_configured", "replay engine is not configured", nil)
+		return
+	}
+	sess, err := s.Replayer.GetSession(r.Context(), r.PathValue("id"))
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, sess)
+}
+
+type executionsResponse struct {
+	SessionID  string                     `json:"session_id"`
+	Executions []execution.EventExecution `json:"executions"`
+}
+
+func (s *server) listReplayExecutions(w http.ResponseWriter, r *http.Request) {
+	if s.Replayer == nil {
+		writeError(w, http.StatusNotImplemented, "not_configured", "replay engine is not configured", nil)
+		return
+	}
+	id := r.PathValue("id")
+	execs, err := s.Replayer.ListExecutions(r.Context(), id)
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, executionsResponse{SessionID: id, Executions: execs})
+}
+
+func (s *server) compareReplays(w http.ResponseWriter, r *http.Request) {
+	if s.Replayer == nil {
+		writeError(w, http.StatusNotImplemented, "not_configured", "replay engine is not configured", nil)
+		return
+	}
+	q := r.URL.Query()
+	left := q.Get("left")
+	right := q.Get("right")
+	if left == "" || right == "" {
+		writeError(w, http.StatusBadRequest, "invalid_query", "both left and right query parameters are required", nil)
+		return
+	}
+	res, err := s.Replayer.Compare(r.Context(), left, right)
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
 // handleError maps domain errors to HTTP responses.
 func (s *server) handleError(w http.ResponseWriter, r *http.Request, err error) {
 	var ve *ingestion.ValidationError
 	switch {
 	case errors.As(err, &ve):
 		writeError(w, http.StatusUnprocessableEntity, "validation_failed", "request validation failed", ve.Fields)
-	case errors.Is(err, eventstore.ErrNotFound):
-		writeError(w, http.StatusNotFound, "not_found", "resource not found", nil)
+	case errors.Is(err, execution.ErrInvalidSessionInput):
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
+	case errors.Is(err, eventstore.ErrNotFound),
+		errors.Is(err, execution.ErrSessionNotFound),
+		errors.Is(err, execution.ErrOriginalNotFound):
+		writeError(w, http.StatusNotFound, "not_found", err.Error(), nil)
 	case errors.Is(err, eventstore.ErrPayloadConflict):
 		writeError(w, http.StatusConflict, "event_conflict", err.Error(), nil)
 	case errors.Is(err, eventstore.ErrSequenceConflict):
 		writeError(w, http.StatusConflict, "sequence_conflict", err.Error(), nil)
+	case errors.Is(err, execution.ErrInvalidTransition):
+		writeError(w, http.StatusConflict, "invalid_transition", err.Error(), nil)
 	case errors.Is(err, context.DeadlineExceeded):
 		writeError(w, http.StatusGatewayTimeout, "timeout", "request timed out", nil)
 	case errors.Is(err, context.Canceled):
