@@ -19,6 +19,7 @@ import (
 	"github.com/Yagna123k/causal-replay-lab/internal/eventstore"
 	"github.com/Yagna123k/causal-replay-lab/internal/execution"
 	"github.com/Yagna123k/causal-replay-lab/internal/ingestion"
+	"github.com/Yagna123k/causal-replay-lab/internal/observability"
 	"github.com/Yagna123k/causal-replay-lab/internal/ordering"
 	"github.com/Yagna123k/causal-replay-lab/internal/processing"
 	"github.com/Yagna123k/causal-replay-lab/internal/replay"
@@ -84,6 +85,7 @@ func run() error {
 		Registry:    registry,
 	})
 
+	metrics := observability.NewMetrics()
 	h := api.NewHandler(api.Deps{
 		Ingester:       ingestion.NewService(repo),
 		Reader:         repo,
@@ -92,10 +94,13 @@ func run() error {
 		Processor:      proc,
 		Inspector:      ordMgr,
 		Recovery:       recMgr,
+		Debugger:       execStore,
+		Metrics:        metrics,
 		Pinger:         repo,
 		Logger:         logger,
 		RequestTimeout: cfg.RequestTimeout,
 		MaxBodyBytes:   cfg.MaxBodyBytes,
+		APIKey:         cfg.APIKey,
 	})
 
 	srv := &http.Server{

@@ -265,31 +265,39 @@ Install dependencies:
 go mod tidy
 ```
 
-Start the local infrastructure:
+Start the full containerized stack (PostgreSQL, migrations, and API server on `:8080`):
 
 ```bash
-docker compose up -d
+docker compose up -d --build
 ```
 
-Run database migrations:
+Or run PostgreSQL in Docker and run migrations + server directly with Go:
 
 ```bash
+docker compose up -d --wait postgres
 make migrate-up
+DATABASE_URL=postgres://replay:replay@localhost:5432/replay?sslmode=disable go run ./cmd/server
 ```
 
-Start the application:
-
-```bash
-go run ./cmd/server
-```
-
-Run tests:
+Run unit tests:
 
 ```bash
 go test ./...
 ```
 
-*These commands represent the intended development workflow and will be finalized as the corresponding implementation files are added.*
+Run full PostgreSQL integration tests:
+
+```bash
+TEST_DATABASE_URL=postgres://replay:replay@localhost:5432/replay?sslmode=disable go test -race -count=1 ./...
+```
+
+### Documentation & Demo
+
+- [Architecture](docs/architecture.md) and [ADRs](docs/adr/)
+- [OpenAPI Specification](docs/openapi.yaml)
+- [Reproducible Demo Walkthrough](docs/demo.md) (`scripts/demo.sh` / `scripts/demo.ps1`)
+- [Measured Benchmarks](docs/benchmarks.md)
+- [Execution Plan](Execution-plan.md)
 
 ---
 

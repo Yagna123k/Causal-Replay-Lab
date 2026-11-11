@@ -3,14 +3,17 @@ package api
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"net/http"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/Yagna123k/causal-replay-lab/internal/ingestion"
+	"github.com/Yagna123k/causal-replay-lab/internal/observability"
 )
 
 // ErrorBody is the consistent error envelope returned by every failing request.
@@ -61,8 +64,37 @@ func requestID(next http.Handler) http.Handler {
 			id = hex.EncodeToString(b[:])
 		}
 		w.Header().Set("X-Request-ID", id)
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, id)))
+		ctx := context.WithValue(r.Context(), ctxKey{}, id)
+		ctx = observability.WithCorrelation(ctx, observability.Correlation{RequestID: id})
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// apiKeyAuth enforces API key authentication on mutating (POST/PUT/PATCH/DELETE)
+// routes when expectedKey is non-empty. When empty, auth is disabled for local dev.
+func apiKeyAuth(expectedKey string) middleware {
+	return func(next http.Handler) http.Handler {
+		if expectedKey == "" {
+			return next
+		}
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
+				next.ServeHTTP(w, r)
+				return
+			}
+			supplied := r.Header.Get("X-API-Key")
+			if supplied == "" {
+				if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+					supplied = strings.TrimPrefix(auth, "Bearer ")
+				}
+			}
+			if len(supplied) == 0 || subtle.ConstantTimeCompare([]byte(supplied), []byte(expectedKey)) != 1 {
+				writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid API key", nil)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 type statusRecorder struct {
@@ -85,14 +117,14 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 	return s.ResponseWriter.Write(b)
 }
 
-func accessLog(log *slog.Logger) middleware {
+func accessLog(log *slog.Logger, metrics *observability.Metrics) middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
 			rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 			next.ServeHTTP(rec, r)
-			log.Info("request",
-				"request_id", RequestID(r.Context()),
+			metrics.IncHTTPRequest(r.Method, r.URL.Path, rec.status)
+			observability.Logger(r.Context(), log).Info("request",
 				"method", r.Method,
 				"path", r.URL.Path,
 				"status", rec.status,
@@ -107,7 +139,7 @@ func recoverer(log *slog.Logger) middleware {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			defer func() {
 				if rec := recover(); rec != nil {
-					log.Error("panic", "panic", rec, "stack", string(debug.Stack()), "request_id", RequestID(r.Context()))
+					observability.Logger(r.Context(), log).Error("panic", "panic", rec, "stack", string(debug.Stack()))
 					writeError(w, http.StatusInternalServerError, "internal_error", "internal server error", nil)
 				}
 			}()

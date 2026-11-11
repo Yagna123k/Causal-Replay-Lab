@@ -28,6 +28,7 @@ type Config struct {
 	RetryMaxAttempts int
 	RetryBaseBackoff time.Duration
 	RetryMaxBackoff  time.Duration
+	APIKey           string
 }
 
 // Load reads configuration using os.Getenv.
@@ -82,6 +83,7 @@ func LoadFrom(get func(string) string) (Config, error) {
 		RetryMaxAttempts: int(integer("RETRY_MAX_ATTEMPTS", 3)),
 		RetryBaseBackoff: dur("RETRY_BASE_BACKOFF", 25*time.Millisecond),
 		RetryMaxBackoff:  dur("RETRY_MAX_BACKOFF", 500*time.Millisecond),
+		APIKey:           str("API_KEY", ""),
 	}
 
 	if cfg.DatabaseURL == "" {
