@@ -363,33 +363,31 @@ These are non-negotiable if the project is to demonstrate real backend engineeri
 Check items off as completed. (20 tasks total.)
 
 ### Phase 1 — Foundation
-- [ ] Go project initialized
-- [ ] PostgreSQL and migrations configured
-- [ ] Event ingestion APIs implemented (with DB-level idempotency)
-- [ ] Event validation and persistence tested
+- [x] Go project initialized
+- [x] PostgreSQL and migrations configured
+- [x] Event ingestion APIs implemented (with DB-level idempotency)
+- [x] Event validation and persistence tested
 
 ### Phase 2 — Replay Engine
-- [ ] Event sequencing implemented
-- [ ] Replay engine with controlled dependencies implemented
-- [ ] Replay sessions and original-execution baselines persisted
-- [ ] Execution history and comparison implemented
+- [x] Event sequencing implemented
+- [x] Replay engine with controlled dependencies implemented
+- [x] Replay sessions and original-execution baselines persisted
+- [x] Execution history and comparison implemented
 
 ### Phase 3 — Consistency
-- [ ] Processing idempotency implemented
-- [ ] Duplicate event handling tested
-- [ ] Out-of-order event policy implemented
-- [ ] Concurrent processing tested
+- [x] Processing idempotency implemented
+- [x] Duplicate event handling tested
+- [x] Out-of-order event policy implemented
+- [x] Concurrent processing tested
 
 ### Phase 4 — Recovery
-- [ ] Atomic checkpointing implemented
-- [ ] Replay resumption implemented
-- [ ] Retry policies implemented
-- [ ] Failure recovery tested
+- [x] Atomic checkpointing implemented
+- [x] Replay resumption implemented
+- [x] Retry policies implemented
+- [x] Failure recovery tested
 
 ### Phase 5 — Production Readiness
-- [ ] Debugging APIs implemented
-- [ ] Unit, integration, and failure-injection tests completed
-- [ ] CI pipeline and benchmarks completed
-- [ ] Docker and documentation completed
-</Content>
-</invoke>
+- [x] Debugging APIs implemented
+- [x] Unit, integration, and failure-injection tests completed
+- [x] CI pipeline and benchmarks completed
+- [x] Docker and documentation completed
