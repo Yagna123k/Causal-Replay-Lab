@@ -1,324 +1,147 @@
 # Causal Replay Lab
 
-**A deterministic event replay and debugging platform for transaction-processing systems.**
+**A deterministic event-replay, idempotency, and fault-recovery platform for transaction-processing systems in Go and PostgreSQL.**
 
+[![CI](https://github.com/Yagna123k/Causal-Replay-Lab/actions/workflows/ci.yml/badge.svg)](https://github.com/Yagna123k/Causal-Replay-Lab/actions/workflows/ci.yml)
 [![Go](https://img.shields.io/badge/Go-1.23+-00ADD8?logo=go)](https://go.dev/)
-[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-Database-4169E1?logo=postgresql)](https://www.postgresql.org/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql)](https://www.postgresql.org/)
 [![Docker](https://img.shields.io/badge/Docker-Containerized-2496ED?logo=docker)](https://www.docker.com/)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-Causal Replay Lab is a backend engineering project designed to capture, replay, and investigate event-driven transaction-processing workflows.
-
-It provides a controlled environment for reproducing transaction failures using persisted event histories, analyzing execution sequences, detecting duplicate events, handling out-of-order delivery, and recovering interrupted processing.
-
-The primary objective is to make transaction-processing failures reproducible, observable, and easier to debug.
+Causal Replay Lab captures immutable transaction event histories, enforces at-most-once processing under concurrent and out-of-order delivery, and replays historical workflows deterministically in an isolated sandbox to pinpoint the exact event and state transition behind a failure—without ever triggering live financial side effects.
 
 ---
 
-## 1. Problem Statement
+## Key Engineering Guarantees
 
-Modern financial and distributed systems process events across multiple services. A single transaction may involve validation, authorization, ledger updates, notifications, and downstream processing.
-
-Failures can occur at any stage.
-
-For example:
-
-1. A transaction is received.
-2. Account validation succeeds.
-3. The ledger is updated.
-4. The service crashes before sending confirmation.
-5. The transaction is retried.
-6. The same event is delivered again.
-
-This can introduce problems such as:
-
-- Duplicate transaction processing.
-- Inconsistent processing states.
-- Out-of-order event execution.
-- Partial transaction failures.
-- Difficult-to-reproduce production issues.
-- Unclear recovery behavior.
-
-Traditional debugging often requires manually reconstructing the original execution sequence.
-
-Causal Replay Lab addresses this problem by preserving event histories and providing deterministic replay capabilities.
-
-## 2. Project Objectives
-
-The system aims to:
-
-- Persist event histories with ordering and execution metadata.
-- Reproduce transaction-processing workflows from historical events.
-- Detect duplicate events and enforce idempotent processing.
-- Handle out-of-order event delivery using explicit ordering policies.
-- Track execution progress through checkpoints.
-- Recover interrupted replay sessions.
-- Compare execution results across replay attempts.
-- Provide debugging APIs for investigating failures.
-- Validate system behavior through automated tests.
-
-## 3. Core Features
-
-### 3.1 Event Ingestion
-
-A REST API accepts events from external producers.
-
-Each event contains:
-
-- Unique event identifier.
-- Transaction or aggregate identifier.
-- Event type.
-- Event payload.
-- Sequence number.
-- Event creation timestamp.
-- Optional metadata.
-
-The ingestion layer validates incoming events and persists them for future processing.
-
-### 3.2 Event Store
-
-PostgreSQL serves as the persistent event store.
-
-Responsibilities:
-
-- Store immutable event records.
-- Maintain event ordering.
-- Retrieve event histories by transaction ID.
-- Track processing status.
-- Preserve execution metadata.
-- Support efficient event-history queries.
-
-### 3.3 Deterministic Replay Engine
-
-The replay engine reconstructs and executes an event sequence from persisted event history.
-
-Capabilities:
-
-- Replay events in a defined order.
-- Reproduce previous processing scenarios.
-- Record execution outcomes.
-- Identify the event responsible for a failure.
-- Compare original execution with replayed execution.
-
-**Determinism requirement:** Given the same event sequence, initial state, processing logic, and controlled dependencies, replay should produce the same logical outcome.
-
-External side effects must be isolated or simulated during replay. The system must not accidentally repeat real financial operations. Handlers receive their dependencies (clock, ID generation, effect sink) through interfaces, and the replay engine is only ever constructed with simulated implementations.
-
-The original execution outcome is stored as a baseline, so any replay can be compared against what actually happened and the first divergent event reported.
-
-### 3.4 Idempotency Management
-
-The system prevents duplicate events from producing duplicate processing effects.
-
-Capabilities:
-
-- Unique event identification.
-- Duplicate-event detection.
-- Idempotency keys.
-- Safe handling of repeated requests.
-- Atomic processing-state updates.
-
-Idempotency enforcement must account for concurrent requests rather than relying solely on an application-level existence check. It is enforced with database unique constraints and atomic inserts. Re-sending an event with the same ID and payload is a safe no-op; the same ID with a different payload is rejected with `409 Conflict`.
-
-### 3.5 Out-of-Order Event Handling
-
-Distributed systems do not always deliver events in their original order.
-
-The system supports:
-
-- Sequence-number validation.
-- Detection of missing events.
-- Identification of out-of-order delivery.
-- Configurable handling policies.
-- Tracking of events awaiting prerequisites.
-
-### 3.6 Checkpoint and Recovery
-
-Replay sessions maintain execution checkpoints.
-
-Capabilities:
-
-- Record the last successfully processed event.
-- Resume interrupted replay sessions.
-- Track failed events.
-- Prevent duplicate effects during recovery.
-- Retry failed events under a controlled policy, with dead-letter handling when retries are exhausted.
-- Inspect replay progress.
-
-### 3.7 Execution Debugging and Observability
-
-The debugging layer provides visibility into replay execution.
-
-Capabilities:
-
-- Inspect transaction event histories.
-- View event execution status.
-- Identify failed processing stages.
-- Retrieve error information.
-- Compare replay executions.
-- Inspect checkpoint and recovery history.
+| Capability | How It Is Enforced |
+|---|---|
+| **Immutable Event Log** | PostgreSQL `BEFORE UPDATE \| DELETE \| TRUNCATE` triggers reject mutations on `events`; processing state lives separately in `event_processing`. |
+| **Idempotent Ingestion** | Canonical JSON + SHA-256 `payload_hash` with `INSERT ... ON CONFLICT DO NOTHING`. Exact retries return `200 OK`; payload or sequence conflicts return `409 Conflict`. |
+| **Side-Effect Isolation** | Event handlers (`Apply`) are pure functions receiving injected `Clock`, `IDGenerator`, and `EffectSink`. The replay engine (`replay.Engine` / `RecoveryManager`) only accepts `SimulatedEffectSink` and has no compile-time path to `LiveEffectSink`. |
+| **Deterministic Diffing** | Replays hash `TransactionState` canonically at every step and compare against the stored `ORIGINAL` baseline (or another replay) to report the exact `first_divergence`. |
+| **Concurrency & Ordering** | `READ COMMITTED` + `SELECT ... FROM transactions ... FOR UPDATE` row locks serialize per-transaction workers. `committed_effects` enforces `(event_id)`, `(idempotency_key)`, and `(transaction_id, sequence_number)` uniqueness in one ACID tx with `idempotency_records`. |
+| **Out-of-Order Policies** | Configurable per-server or per-request: `BUFFER` (persists to `pending_events` and auto-drains contiguously when gaps fill), `REJECT` (`409` + `Retry-After`), or `FAIL_AND_FLAG`. |
+| **Atomic Checkpoints & Leases** | Checkpoints (`state_snapshot` + `state_hash`) commit in the same transaction as `replay_executions`. Resumption verifies snapshot integrity and uses `locked_by` / `lease_expires_at` leases so two workers never resume the same session. |
+| **Controlled Retries & DLQ** | Error classification (`Retryable` vs `NonRetryable`), exponential backoff with seeded jitter, full `replay_execution_attempts` audit trail, and `DEAD` status when retries exhaust. |
+| **Observability & Hardening** | Context-propagated correlation IDs (`request_id`, `replay_id`, `transaction_id`, `event_id`), Prometheus `/metrics`, `/healthz` + `/readyz`, optional `API_KEY` auth on `POST` routes, and graceful shutdown. |
 
 ---
 
-## 4. Architecture
+## Architecture
 
-The initial architecture follows a modular monolith approach.
-
-This keeps the system straightforward to develop while maintaining clear boundaries between components.
+Structured as a modular Go monolith backed by PostgreSQL so cross-cutting invariants (effects + idempotency records, executions + checkpoints) execute inside single ACID transactions without distributed two-phase commit.
 
 ```text
-                 External Event Producers
-                           |
-                           v
-                  +------------------+
-                  |   REST API Layer |
-                  +------------------+
-                           |
-                           v
-                  +------------------+
-                  |  Event Ingestion |
-                  +------------------+
-                           |
-                           v
-                  +------------------+
-                  |    Event Store   |
-                  |   (PostgreSQL)   |
-                  +------------------+
-                           |
-                           v
-                  +------------------+
-                  |   Replay Engine  |
-                  +------------------+
-                           |
-             +-------------+-------------+
-             |             |             |
-             v             v             v
-       Idempotency     Checkpoint     Execution
-        Manager         Manager        Tracker
-          Ordering        Recovery
-          Manager         Manager
-             |             |             |
-             +-------------+-------------+
-                           |
-                           v
-                  +------------------+
-                  | Debugging APIs   |
-                  +------------------+
-                           |
-                           v
-                   Replay Results
+  REST API (api) ──► Ingestion & Validation (ingestion) ──► Immutable Event Store (eventstore)
+        │                                                               │
+        ├──► Live Processor (processing)                                │
+        │      ├── Idempotency Manager (idempotency)                    │
+        │      └── Ordering Manager (ordering: BUFFER/REJECT/FLAG)      │
+        │                                                               ▼
+        └──► Replay & Recovery (replay) ◄────────────────── Execution Store & Checkpoints
+               ├── Controlled Deps (EventClock, DeterministicIDGen, SimulatedEffectSink)
+               ├── Retry Policy (seeded backoff + DLQ) & Lease Recovery
+               └── Comparison & Timeline Debugger (execution) ──► /metrics & Structured Logs
 ```
 
-### Architectural Modules
+<details>
+<summary><strong>Repository Package Map</strong></summary>
 
-| Module | Responsibility |
+| Path | Responsibility |
 |---|---|
-| API | HTTP routing, request validation, response handling |
-| Ingestion | Event validation and persistence |
-| Event Store | Event history and metadata management |
-| Replay Engine | Event sequencing and replay execution |
-| Idempotency | Duplicate detection and processing guarantees |
-| Ordering | Sequence-gap detection and configurable out-of-order policies (`BUFFER`, `REJECT`, `FAIL_AND_FLAG`) |
-| Checkpoint | Replay progress, persisted atomically with the state it represents |
-| Recovery | Resuming interrupted sessions using lease-based ownership |
-| Execution | Original and replay results, errors, and execution history |
-| Observability | Structured logs and debugging information |
+| `cmd/server` | HTTP server entrypoint, dependency wiring, graceful shutdown |
+| `cmd/migrate` | Embedded SQL migration runner (`up` / `down`) using PostgreSQL advisory locks |
+| `internal/ingestion` | Request validation, canonical JSON normalization, SHA-256 payload hashing |
+| `internal/eventstore` | Immutable `events`, `transactions`, and `event_processing` persistence |
+| `internal/idempotency` | `idempotency_records` atomic claims & processing state machine |
+| `internal/ordering` | Sequence gap detection, `BUFFER`/`REJECT`/`FAIL_AND_FLAG`, pending expiry |
+| `internal/processing` | Row-locked live event processor with automatic contiguous buffer draining |
+| `internal/execution` | Canonical state hashing, session store, comparison diffing, timeline & failure queries |
+| `internal/checkpoint` | Single-transaction checkpoint commits & hash integrity verification |
+| `internal/replay` | Pure handler registry, controlled deps, deterministic replay, retries, lease recovery |
+| `internal/observability` | Correlation ID propagation (`slog`) & Prometheus `/metrics` exposition |
+| `internal/api` | REST routing, error envelope, middleware, optional `API_KEY` auth |
+| `migrations/` | Versioned SQL schemas (`0001_init` through `0004_recovery`) |
+
+</details>
 
 ---
 
-## 5. Technology Stack
+## Quick Start & Demo
 
-| Technology | Usage |
-|---|---|
-| Go | Backend services and replay engine |
-| PostgreSQL | Event storage and transactional consistency |
-| REST APIs | Event ingestion and replay interfaces |
-| Docker | Local development and reproducible environments |
-| Go Testing | Unit and integration testing |
-| GitHub Actions | Continuous integration |
-| Structured Logging | Execution tracing and debugging |
+### 1. Run the full stack with Docker Compose
 
-The implementation will initially use a modular Go application rather than introducing unnecessary microservices.
-
----
-
-## 6. Getting Started
-
-Prerequisites:
-
-- Go 1.23 or later.
-- PostgreSQL.
-- Docker and Docker Compose.
-- Git.
-
-Clone the repository:
-
-```bash
-git clone https://github.com/Yagna123k/causal-replay-lab.git
-
-cd causal-replay-lab
-```
-
-Install dependencies:
-
-```bash
-go mod tidy
-```
-
-Start the full containerized stack (PostgreSQL, migrations, and API server on `:8080`):
+Starts PostgreSQL 16, applies all migrations, and launches the API server on `:8080`:
 
 ```bash
 docker compose up -d --build
 ```
 
-Or run PostgreSQL in Docker and run migrations + server directly with Go:
+### 2. Run the Failure → Replay → Diagnosis Demo
+
+Ingests a multi-step transaction that fails at step 3 due to insufficient balance, captures the `ORIGINAL` baseline, runs an isolated replay, and queries `/failures`, `/checkpoints`, and `/replay-comparisons`:
 
 ```bash
+# Linux / macOS
+bash scripts/demo.sh
+
+# Windows (PowerShell)
+pwsh -File scripts/demo.ps1
+```
+
+### 3. Local Go Development & Tests
+
+```bash
+# Start only PostgreSQL in Docker, migrate, and run server locally
 docker compose up -d --wait postgres
 make migrate-up
 DATABASE_URL=postgres://replay:replay@localhost:5432/replay?sslmode=disable go run ./cmd/server
-```
 
-Run unit tests:
-
-```bash
+# Unit tests (no DB required)
 go test ./...
-```
 
-Run full PostgreSQL integration tests:
-
-```bash
+# Full PostgreSQL integration, concurrency, and failure-injection suite
 TEST_DATABASE_URL=postgres://replay:replay@localhost:5432/replay?sslmode=disable go test -race -count=1 ./...
 ```
 
-### Documentation & Demo
+---
 
-- [Architecture](docs/architecture.md) and [ADRs](docs/adr/)
-- [OpenAPI Specification](docs/openapi.yaml)
-- [Reproducible Demo Walkthrough](docs/demo.md) (`scripts/demo.sh` / `scripts/demo.ps1`)
-- [Measured Benchmarks](docs/benchmarks.md)
-- [Execution Plan](Execution-plan.md)
+## API Overview
+
+Full contract: [`docs/openapi.yaml`](docs/openapi.yaml)
+
+| Group | Endpoints |
+|---|---|
+| **Ingestion & Query** | `POST /api/v1/events` · `GET /api/v1/events/{id}` · `GET /api/v1/transactions/{id}/events` |
+| **Consistent Processing** | `POST /api/v1/events/{id}/process` · `POST /api/v1/transactions/{id}/process-events` · `GET /api/v1/transactions/{id}/status` |
+| **Deterministic Replay** | `POST /api/v1/transactions/{id}/process` · `POST /api/v1/replays` · `POST /api/v1/replays/{id}/start` · `GET /api/v1/replays/{id}` · `GET /api/v1/replays/{id}/executions` · `GET /api/v1/replay-comparisons?left={id}&right=original` |
+| **Recovery & Checkpoints** | `POST /api/v1/replays/{id}/pause` · `POST /api/v1/replays/{id}/resume` · `GET /api/v1/replays/{id}/checkpoints` · `GET /api/v1/replays/{id}/attempts` · `POST /api/v1/replay-recovery/orphans` |
+| **Debugging & Ops** | `GET /api/v1/transactions/{id}` · `GET /api/v1/transactions/{id}/timeline` · `GET /api/v1/replays/{id}/failures` · `GET /metrics` · `GET /healthz` · `GET /readyz` |
 
 ---
 
-## 7. Engineering Principles
+## Measured Performance & CI
 
-The project prioritizes:
+All numbers below are measured directly on `windows/amd64` (`Intel Core i5-8250U @ 1.60GHz`) with `go test -run=NONE -bench=Benchmark -benchmem -count=3` (in-memory store; full methodology in [`docs/benchmarks.md`](docs/benchmarks.md)):
 
-- **Correctness over throughput:** Event processing must preserve defined invariants.
-- **Deterministic execution:** Replay should be reproducible under controlled inputs.
-- **Data integrity:** Persistence and processing state must remain consistent.
-- **Failure transparency:** Every replay failure should be inspectable.
-- **Idempotency:** Repeated delivery must not create unintended duplicate effects.
-- **Recoverability:** Interrupted processing must be recoverable.
-- **Testability:** Critical system behavior must be verified through automated tests.
+- **Event normalization & SHA-256 hashing:** `14.1–19.2 µs/op` (`3,192 B/op`, `67 allocs/op`)
+- **5-event deterministic replay workflow:** `33.6–53.4 µs/op` (`19,410 B/op`, `102 allocs/op`)
+- **Execution diff & divergence detection:** `13.5–19.0 µs/op` (`5,594 B/op`, `60 allocs/op`)
+
+GitHub Actions CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `go vet`, `golangci-lint`, `go test -race -coverprofile=coverage.out ./...` against PostgreSQL 16 (including 20-goroutine concurrency, mid-transaction failure injection, corrupt checkpoint detection, and lease takeover tests), and verifies the multi-stage non-root Docker build.
 
 ---
 
-## 8. License
+## Documentation
 
-This project is licensed under the MIT License. See the `LICENSE` file for details.
+- [Architecture & Database Invariants](docs/architecture.md)
+- [Architecture Decision Records (ADRs)](docs/adr/)
+- [OpenAPI 3.0 Specification](docs/openapi.yaml)
+- [Demo Walkthrough](docs/demo.md)
+- [Benchmark Methodology & Results](docs/benchmarks.md)
+- [5-Phase Execution Plan](Execution-plan.md)
 
----
+## License
 
-**Causal Replay Lab - Making transaction-processing failures reproducible.**
+MIT — see [`LICENSE`](LICENSE).
