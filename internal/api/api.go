@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Yagna123k/causal-replay-lab/internal/checkpoint"
 	"github.com/Yagna123k/causal-replay-lab/internal/eventstore"
 	"github.com/Yagna123k/causal-replay-lab/internal/execution"
 	"github.com/Yagna123k/causal-replay-lab/internal/idempotency"
@@ -58,6 +59,17 @@ type OrderingInspector interface {
 	InspectTransaction(ctx context.Context, transactionID string) (ordering.TransactionStatus, error)
 }
 
+// RecoveryCoordinator manages checkpointed replay execution, pause/resume,
+// retry attempts, and orphaned-session recovery.
+type RecoveryCoordinator interface {
+	StartWithRecovery(ctx context.Context, sessionID, workerID string) (replay.StartResult, error)
+	ResumeSession(ctx context.Context, sessionID, workerID string) (replay.StartResult, error)
+	PauseSession(ctx context.Context, sessionID string) (execution.Session, error)
+	ListCheckpoints(ctx context.Context, sessionID string) ([]checkpoint.Checkpoint, error)
+	ListAttempts(ctx context.Context, sessionID string) ([]execution.ExecutionAttempt, error)
+	DetectOrphanedSessions(ctx context.Context, now time.Time) ([]execution.Session, error)
+}
+
 // Pinger checks dependency health.
 type Pinger interface {
 	Ping(ctx context.Context) error
@@ -71,6 +83,7 @@ type Deps struct {
 	Original       OriginalProcessor
 	Processor      EventProcessor
 	Inspector      OrderingInspector
+	Recovery       RecoveryCoordinator
 	Pinger         Pinger
 	Logger         *slog.Logger
 	RequestTimeout time.Duration
@@ -109,8 +122,13 @@ func NewHandler(d Deps) http.Handler {
 	mux.HandleFunc("POST /api/v1/transactions/{id}/process-events", s.processTransactionEvents)
 	mux.HandleFunc("POST /api/v1/replays", s.createReplay)
 	mux.HandleFunc("POST /api/v1/replays/{id}/start", s.startReplay)
+	mux.HandleFunc("POST /api/v1/replays/{id}/resume", s.resumeReplay)
+	mux.HandleFunc("POST /api/v1/replays/{id}/pause", s.pauseReplay)
 	mux.HandleFunc("GET /api/v1/replays/{id}", s.getReplay)
 	mux.HandleFunc("GET /api/v1/replays/{id}/executions", s.listReplayExecutions)
+	mux.HandleFunc("GET /api/v1/replays/{id}/checkpoints", s.listReplayCheckpoints)
+	mux.HandleFunc("GET /api/v1/replays/{id}/attempts", s.listReplayAttempts)
+	mux.HandleFunc("POST /api/v1/replay-recovery/orphans", s.recoverOrphans)
 	mux.HandleFunc("GET /api/v1/replay-comparisons", s.compareReplays)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "route not found", nil)
@@ -348,6 +366,21 @@ func (s *server) createReplay(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) startReplay(w http.ResponseWriter, r *http.Request) {
+	if s.Recovery != nil {
+		workerID := r.Header.Get("X-Worker-ID")
+		res, err := s.Recovery.StartWithRecovery(r.Context(), r.PathValue("id"), workerID)
+		if err != nil {
+			if res.Session.SessionID == "" ||
+				errors.Is(err, execution.ErrSessionNotFound) ||
+				errors.Is(err, execution.ErrInvalidTransition) ||
+				errors.Is(err, execution.ErrSessionLocked) {
+				s.handleError(w, r, err)
+				return
+			}
+		}
+		writeJSON(w, http.StatusOK, res)
+		return
+	}
 	if s.Replayer == nil {
 		writeError(w, http.StatusNotImplemented, "not_configured", "replay engine is not configured", nil)
 		return
@@ -362,6 +395,99 @@ func (s *server) startReplay(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *server) resumeReplay(w http.ResponseWriter, r *http.Request) {
+	if s.Recovery == nil {
+		writeError(w, http.StatusNotImplemented, "not_configured", "recovery coordinator is not configured", nil)
+		return
+	}
+	workerID := r.Header.Get("X-Worker-ID")
+	res, err := s.Recovery.ResumeSession(r.Context(), r.PathValue("id"), workerID)
+	if err != nil {
+		if res.Session.SessionID == "" ||
+			errors.Is(err, execution.ErrSessionNotFound) ||
+			errors.Is(err, execution.ErrInvalidTransition) ||
+			errors.Is(err, execution.ErrSessionLocked) ||
+			errors.Is(err, checkpoint.ErrCorruptCheckpoint) {
+			s.handleError(w, r, err)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *server) pauseReplay(w http.ResponseWriter, r *http.Request) {
+	if s.Recovery == nil {
+		writeError(w, http.StatusNotImplemented, "not_configured", "recovery coordinator is not configured", nil)
+		return
+	}
+	sess, err := s.Recovery.PauseSession(r.Context(), r.PathValue("id"))
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, sess)
+}
+
+func (s *server) listReplayCheckpoints(w http.ResponseWriter, r *http.Request) {
+	if s.Recovery == nil {
+		writeError(w, http.StatusNotImplemented, "not_configured", "recovery coordinator is not configured", nil)
+		return
+	}
+	id := r.PathValue("id")
+	cps, err := s.Recovery.ListCheckpoints(r.Context(), id)
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"session_id":  id,
+		"checkpoints": cps,
+	})
+}
+
+func (s *server) listReplayAttempts(w http.ResponseWriter, r *http.Request) {
+	if s.Recovery == nil {
+		writeError(w, http.StatusNotImplemented, "not_configured", "recovery coordinator is not configured", nil)
+		return
+	}
+	id := r.PathValue("id")
+	atts, err := s.Recovery.ListAttempts(r.Context(), id)
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"session_id": id,
+		"attempts":   atts,
+	})
+}
+
+func (s *server) recoverOrphans(w http.ResponseWriter, r *http.Request) {
+	if s.Recovery == nil {
+		writeError(w, http.StatusNotImplemented, "not_configured", "recovery coordinator is not configured", nil)
+		return
+	}
+	orphans, err := s.Recovery.DetectOrphanedSessions(r.Context(), time.Now().UTC())
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
+	var resumed []replay.StartResult
+	if r.URL.Query().Get("resume") == "true" {
+		workerID := r.Header.Get("X-Worker-ID")
+		for _, o := range orphans {
+			res, _ := s.Recovery.ResumeSession(r.Context(), o.SessionID, workerID)
+			if res.Session.SessionID != "" {
+				resumed = append(resumed, res)
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"orphaned": orphans,
+		"resumed":  resumed,
+	})
 }
 
 func (s *server) getReplay(w http.ResponseWriter, r *http.Request) {
@@ -435,6 +561,10 @@ func (s *server) handleError(w http.ResponseWriter, r *http.Request, err error) 
 		writeError(w, http.StatusConflict, "sequence_conflict", err.Error(), nil)
 	case errors.Is(err, execution.ErrInvalidTransition):
 		writeError(w, http.StatusConflict, "invalid_transition", err.Error(), nil)
+	case errors.Is(err, execution.ErrSessionLocked):
+		writeError(w, http.StatusConflict, "session_locked", err.Error(), nil)
+	case errors.Is(err, checkpoint.ErrCorruptCheckpoint):
+		writeError(w, http.StatusConflict, "corrupt_checkpoint", err.Error(), nil)
 	case errors.Is(err, idempotency.ErrKeyConflict):
 		writeError(w, http.StatusConflict, "idempotency_conflict", err.Error(), nil)
 	case errors.Is(err, idempotency.ErrAlreadyInProgress):

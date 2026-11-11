@@ -24,6 +24,10 @@ type Config struct {
 	OrderingPolicy  string // "BUFFER", "REJECT", or "FAIL_AND_FLAG"
 	IdempotencyTTL  time.Duration
 	PendingGapTTL   time.Duration
+	LeaseTTL        time.Duration
+	RetryMaxAttempts int
+	RetryBaseBackoff time.Duration
+	RetryMaxBackoff  time.Duration
 }
 
 // Load reads configuration using os.Getenv.
@@ -71,9 +75,13 @@ func LoadFrom(get func(string) string) (Config, error) {
 		ShutdownTimeout: dur("SHUTDOWN_TIMEOUT", 15*time.Second),
 		DBMaxConns:      int32(integer("DB_MAX_CONNS", 10)),
 		MaxBodyBytes:    integer("MAX_BODY_BYTES", 1<<20),
-		OrderingPolicy:  strings.ToUpper(str("ORDERING_POLICY", "BUFFER")),
-		IdempotencyTTL:  dur("IDEMPOTENCY_TTL", 24*time.Hour),
-		PendingGapTTL:   dur("PENDING_GAP_TTL", time.Hour),
+		OrderingPolicy:   strings.ToUpper(str("ORDERING_POLICY", "BUFFER")),
+		IdempotencyTTL:   dur("IDEMPOTENCY_TTL", 24*time.Hour),
+		PendingGapTTL:    dur("PENDING_GAP_TTL", time.Hour),
+		LeaseTTL:         dur("LEASE_TTL", 30*time.Second),
+		RetryMaxAttempts: int(integer("RETRY_MAX_ATTEMPTS", 3)),
+		RetryBaseBackoff: dur("RETRY_BASE_BACKOFF", 25*time.Millisecond),
+		RetryMaxBackoff:  dur("RETRY_MAX_BACKOFF", 500*time.Millisecond),
 	}
 
 	if cfg.DatabaseURL == "" {

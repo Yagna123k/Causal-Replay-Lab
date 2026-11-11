@@ -20,23 +20,33 @@ const (
 	ModeReplay   Mode = "REPLAY"
 )
 
-// SessionStatus represents the Phase 2 lifecycle of a replay/execution session.
+// SessionStatus represents the full lifecycle of a replay/execution session.
+// CREATED -> RUNNING -> PAUSED/INTERRUPTED -> RESUMING -> COMPLETED | FAILED
 type SessionStatus string
 
 const (
-	StatusCreated   SessionStatus = "CREATED"
-	StatusRunning   SessionStatus = "RUNNING"
-	StatusCompleted SessionStatus = "COMPLETED"
-	StatusFailed    SessionStatus = "FAILED"
+	StatusCreated     SessionStatus = "CREATED"
+	StatusRunning     SessionStatus = "RUNNING"
+	StatusPaused      SessionStatus = "PAUSED"
+	StatusInterrupted SessionStatus = "INTERRUPTED"
+	StatusResuming    SessionStatus = "RESUMING"
+	StatusCompleted   SessionStatus = "COMPLETED"
+	StatusFailed      SessionStatus = "FAILED"
 )
 
 // CanTransition reports whether a session status transition is valid.
 func CanTransition(from, to SessionStatus) bool {
 	switch from {
 	case StatusCreated:
-		return to == StatusRunning
+		return to == StatusRunning || to == StatusPaused
 	case StatusRunning:
-		return to == StatusCompleted || to == StatusFailed
+		return to == StatusPaused || to == StatusInterrupted || to == StatusCompleted || to == StatusFailed
+	case StatusPaused:
+		return to == StatusResuming || to == StatusInterrupted
+	case StatusInterrupted:
+		return to == StatusResuming
+	case StatusResuming:
+		return to == StatusRunning || to == StatusPaused || to == StatusInterrupted || to == StatusCompleted || to == StatusFailed
 	default:
 		return false
 	}
@@ -47,7 +57,9 @@ type EventStatus string
 
 const (
 	EventSucceeded EventStatus = "SUCCEEDED"
+	EventRetrying  EventStatus = "RETRYING"
 	EventFailed    EventStatus = "FAILED"
+	EventDead      EventStatus = "DEAD"
 )
 
 var (
@@ -65,6 +77,8 @@ var (
 	ErrNoEventsToReplay = errors.New("no events found for replay")
 	// ErrInvalidSessionInput indicates invalid replay session parameters.
 	ErrInvalidSessionInput = errors.New("invalid replay session parameters")
+	// ErrSessionLocked indicates another worker holds an active lease on the session.
+	ErrSessionLocked = errors.New("replay session is locked by another worker")
 )
 
 // Effect represents an external side effect produced while processing an event
@@ -139,20 +153,24 @@ func (s TransactionState) Hash() string {
 
 // Session represents a persisted original execution or replay run.
 type Session struct {
-	SessionID      string            `json:"session_id"`
-	TransactionID  string            `json:"transaction_id"`
-	Mode           Mode              `json:"mode"`
-	Status         SessionStatus     `json:"status"`
-	FromSequence   *int64            `json:"from_sequence,omitempty"`
-	ToSequence     *int64            `json:"to_sequence,omitempty"`
-	InitialState   *TransactionState `json:"initial_state,omitempty"`
-	EventCount     int               `json:"event_count"`
-	FinalState     *TransactionState `json:"final_state,omitempty"`
-	FinalStateHash string            `json:"final_state_hash,omitempty"`
-	Error          string            `json:"error,omitempty"`
-	CreatedAt      time.Time         `json:"created_at"`
-	StartedAt      *time.Time        `json:"started_at,omitempty"`
-	CompletedAt    *time.Time        `json:"completed_at,omitempty"`
+	SessionID         string            `json:"session_id"`
+	TransactionID     string            `json:"transaction_id"`
+	Mode              Mode              `json:"mode"`
+	Status            SessionStatus     `json:"status"`
+	FromSequence      *int64            `json:"from_sequence,omitempty"`
+	ToSequence        *int64            `json:"to_sequence,omitempty"`
+	InitialState      *TransactionState `json:"initial_state,omitempty"`
+	EventCount        int               `json:"event_count"`
+	LastCheckpointSeq int64             `json:"last_checkpoint_seq"`
+	FinalState        *TransactionState `json:"final_state,omitempty"`
+	FinalStateHash    string            `json:"final_state_hash,omitempty"`
+	Error             string            `json:"error,omitempty"`
+	LockedBy          string            `json:"locked_by,omitempty"`
+	LeaseExpiresAt    *time.Time        `json:"lease_expires_at,omitempty"`
+	HeartbeatAt       *time.Time        `json:"heartbeat_at,omitempty"`
+	CreatedAt         time.Time         `json:"created_at"`
+	StartedAt         *time.Time        `json:"started_at,omitempty"`
+	CompletedAt       *time.Time        `json:"completed_at,omitempty"`
 }
 
 // EventExecution records the outcome of applying one event within a Session.
@@ -166,8 +184,24 @@ type EventExecution struct {
 	StateHash      string           `json:"state_hash"`
 	StateAfter     TransactionState `json:"state_after"`
 	Effects        []Effect         `json:"effects"`
+	AttemptCount   int              `json:"attempt_count"`
+	NextRetryAt    *time.Time       `json:"next_retry_at,omitempty"`
+	IsDeadLetter   bool             `json:"is_dead_letter,omitempty"`
 	Error          string           `json:"error,omitempty"`
 	ExecutedAt     time.Time        `json:"executed_at"`
+}
+
+// ExecutionAttempt records one attempt (initial or retry) for a single event in a session.
+type ExecutionAttempt struct {
+	AttemptID      int64       `json:"attempt_id"`
+	SessionID      string      `json:"session_id"`
+	EventID        string      `json:"event_id"`
+	SequenceNumber int64       `json:"sequence_number"`
+	AttemptNumber  int         `json:"attempt_number"`
+	Status         EventStatus `json:"status"`
+	Error          string      `json:"error,omitempty"`
+	NextRetryAt    *time.Time  `json:"next_retry_at,omitempty"`
+	AttemptedAt    time.Time   `json:"attempted_at"`
 }
 
 // CanonicalEffectsHash computes a deterministic hash over a slice of effects.
