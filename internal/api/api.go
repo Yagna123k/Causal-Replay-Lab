@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -12,7 +13,10 @@ import (
 
 	"github.com/Yagna123k/causal-replay-lab/internal/eventstore"
 	"github.com/Yagna123k/causal-replay-lab/internal/execution"
+	"github.com/Yagna123k/causal-replay-lab/internal/idempotency"
 	"github.com/Yagna123k/causal-replay-lab/internal/ingestion"
+	"github.com/Yagna123k/causal-replay-lab/internal/ordering"
+	"github.com/Yagna123k/causal-replay-lab/internal/processing"
 	"github.com/Yagna123k/causal-replay-lab/internal/replay"
 )
 
@@ -43,6 +47,17 @@ type OriginalProcessor interface {
 	ProcessOriginal(ctx context.Context, transactionID string) (execution.Session, error)
 }
 
+// EventProcessor executes ingested events with idempotency and ordering guarantees.
+type EventProcessor interface {
+	ProcessEvent(ctx context.Context, eventID, idempotencyKey string, policyOverride ordering.Policy) (processing.ProcessOutcome, error)
+	ProcessTransaction(ctx context.Context, transactionID string, policyOverride ordering.Policy) ([]processing.ProcessOutcome, error)
+}
+
+// OrderingInspector inspects transaction consistency, sequence gaps, and pending events.
+type OrderingInspector interface {
+	InspectTransaction(ctx context.Context, transactionID string) (ordering.TransactionStatus, error)
+}
+
 // Pinger checks dependency health.
 type Pinger interface {
 	Ping(ctx context.Context) error
@@ -54,6 +69,8 @@ type Deps struct {
 	Reader         Reader
 	Replayer       Replayer
 	Original       OriginalProcessor
+	Processor      EventProcessor
+	Inspector      OrderingInspector
 	Pinger         Pinger
 	Logger         *slog.Logger
 	RequestTimeout time.Duration
@@ -85,8 +102,11 @@ func NewHandler(d Deps) http.Handler {
 	mux.HandleFunc("GET /readyz", s.readyz)
 	mux.HandleFunc("POST /api/v1/events", s.ingestEvent)
 	mux.HandleFunc("GET /api/v1/events/{id}", s.getEvent)
+	mux.HandleFunc("POST /api/v1/events/{id}/process", s.processEvent)
 	mux.HandleFunc("GET /api/v1/transactions/{id}/events", s.listTransactionEvents)
+	mux.HandleFunc("GET /api/v1/transactions/{id}/status", s.getTransactionStatus)
 	mux.HandleFunc("POST /api/v1/transactions/{id}/process", s.processOriginal)
+	mux.HandleFunc("POST /api/v1/transactions/{id}/process-events", s.processTransactionEvents)
 	mux.HandleFunc("POST /api/v1/replays", s.createReplay)
 	mux.HandleFunc("POST /api/v1/replays/{id}/start", s.startReplay)
 	mux.HandleFunc("GET /api/v1/replays/{id}", s.getReplay)
@@ -199,6 +219,100 @@ func (s *server) listTransactionEvents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+type processEventBody struct {
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
+	Policy         string `json:"policy,omitempty"`
+}
+
+func (s *server) processEvent(w http.ResponseWriter, r *http.Request) {
+	if s.Processor == nil {
+		writeError(w, http.StatusNotImplemented, "not_configured", "event processor is not configured", nil)
+		return
+	}
+	var body processEventBody
+	if r.Body != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, s.MaxBodyBytes)
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				writeError(w, http.StatusRequestEntityTooLarge, "body_too_large", "request body too large", nil)
+				return
+			}
+			writeError(w, http.StatusBadRequest, "invalid_json", "failed to read request body", nil)
+			return
+		}
+		if len(raw) > 0 {
+			if err := json.Unmarshal(raw, &body); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid_json", "malformed JSON request body: "+err.Error(), nil)
+				return
+			}
+		}
+	}
+	key := r.Header.Get("Idempotency-Key")
+	if body.IdempotencyKey != "" {
+		key = body.IdempotencyKey
+	}
+	var policy ordering.Policy
+	if body.Policy != "" {
+		var err error
+		policy, err = ordering.ParsePolicy(body.Policy)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_policy", err.Error(), nil)
+			return
+		}
+	}
+
+	out, err := s.Processor.ProcessEvent(r.Context(), r.PathValue("id"), key, policy)
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
+	status := http.StatusOK
+	if out.Buffered {
+		status = http.StatusAccepted
+	}
+	writeJSON(w, status, out)
+}
+
+func (s *server) processTransactionEvents(w http.ResponseWriter, r *http.Request) {
+	if s.Processor == nil {
+		writeError(w, http.StatusNotImplemented, "not_configured", "event processor is not configured", nil)
+		return
+	}
+	var policy ordering.Policy
+	if p := r.URL.Query().Get("policy"); p != "" {
+		var err error
+		policy, err = ordering.ParsePolicy(p)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_policy", err.Error(), nil)
+			return
+		}
+	}
+	outcomes, err := s.Processor.ProcessTransaction(r.Context(), r.PathValue("id"), policy)
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"transaction_id": r.PathValue("id"),
+		"outcomes":       outcomes,
+	})
+}
+
+func (s *server) getTransactionStatus(w http.ResponseWriter, r *http.Request) {
+	if s.Inspector == nil {
+		writeError(w, http.StatusNotImplemented, "not_configured", "ordering inspector is not configured", nil)
+		return
+	}
+	st, err := s.Inspector.InspectTransaction(r.Context(), r.PathValue("id"))
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
 func (s *server) processOriginal(w http.ResponseWriter, r *http.Request) {
 	if s.Original == nil {
 		writeError(w, http.StatusNotImplemented, "not_configured", "original processor is not configured", nil)
@@ -308,7 +422,8 @@ func (s *server) handleError(w http.ResponseWriter, r *http.Request, err error) 
 	switch {
 	case errors.As(err, &ve):
 		writeError(w, http.StatusUnprocessableEntity, "validation_failed", "request validation failed", ve.Fields)
-	case errors.Is(err, execution.ErrInvalidSessionInput):
+	case errors.Is(err, execution.ErrInvalidSessionInput),
+		errors.Is(err, idempotency.ErrInvalidKey):
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
 	case errors.Is(err, eventstore.ErrNotFound),
 		errors.Is(err, execution.ErrSessionNotFound),
@@ -320,6 +435,15 @@ func (s *server) handleError(w http.ResponseWriter, r *http.Request, err error) 
 		writeError(w, http.StatusConflict, "sequence_conflict", err.Error(), nil)
 	case errors.Is(err, execution.ErrInvalidTransition):
 		writeError(w, http.StatusConflict, "invalid_transition", err.Error(), nil)
+	case errors.Is(err, idempotency.ErrKeyConflict):
+		writeError(w, http.StatusConflict, "idempotency_conflict", err.Error(), nil)
+	case errors.Is(err, idempotency.ErrAlreadyInProgress):
+		writeError(w, http.StatusConflict, "idempotency_in_progress", err.Error(), nil)
+	case errors.Is(err, ordering.ErrOutOfOrder):
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusConflict, "out_of_order_retryable", err.Error(), nil)
+	case errors.Is(err, ordering.ErrSequenceGapFlagged):
+		writeError(w, http.StatusConflict, "sequence_gap_flagged", err.Error(), nil)
 	case errors.Is(err, context.DeadlineExceeded):
 		writeError(w, http.StatusGatewayTimeout, "timeout", "request timed out", nil)
 	case errors.Is(err, context.Canceled):

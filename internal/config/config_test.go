@@ -16,7 +16,8 @@ func TestLoadDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.HTTPAddr != ":8080" || cfg.RequestTimeout != 10*time.Second || cfg.LogLevel != slog.LevelInfo || cfg.DBMaxConns != 10 {
+	if cfg.HTTPAddr != ":8080" || cfg.RequestTimeout != 10*time.Second || cfg.LogLevel != slog.LevelInfo ||
+		cfg.DBMaxConns != 10 || cfg.OrderingPolicy != "BUFFER" || cfg.IdempotencyTTL != 24*time.Hour || cfg.PendingGapTTL != time.Hour {
 		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
 }
@@ -45,11 +46,12 @@ func TestLoadValidation(t *testing.T) {
 		"DB_MAX_CONNS":    "-1",
 		"LOG_FORMAT":      "xml",
 		"LOG_LEVEL":       "loud",
+		"ORDERING_POLICY": "chaos",
 	}))
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	for _, want := range []string{"DATABASE_URL", "REQUEST_TIMEOUT", "DB_MAX_CONNS", "LOG_FORMAT", "LOG_LEVEL"} {
+	for _, want := range []string{"DATABASE_URL", "REQUEST_TIMEOUT", "DB_MAX_CONNS", "LOG_FORMAT", "LOG_LEVEL", "ORDERING_POLICY"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error should mention %s: %v", want, err)
 		}

@@ -18,6 +18,8 @@ import (
 	"github.com/Yagna123k/causal-replay-lab/internal/eventstore"
 	"github.com/Yagna123k/causal-replay-lab/internal/execution"
 	"github.com/Yagna123k/causal-replay-lab/internal/ingestion"
+	"github.com/Yagna123k/causal-replay-lab/internal/ordering"
+	"github.com/Yagna123k/causal-replay-lab/internal/processing"
 	"github.com/Yagna123k/causal-replay-lab/internal/replay"
 )
 
@@ -60,12 +62,26 @@ func run() error {
 	})
 	replayEngine := replay.NewEngine(repo, execStore, registry)
 	origRunner := replay.NewOriginalRunner(repo, execStore, registry, liveSink)
+	policy, err := ordering.ParsePolicy(cfg.OrderingPolicy)
+	if err != nil {
+		return err
+	}
+	ordMgr := ordering.NewManager(pool)
+	proc := processing.NewProcessor(pool, processing.Options{
+		DefaultPolicy:  policy,
+		IdempotencyTTL: cfg.IdempotencyTTL,
+		PendingGapTTL:  cfg.PendingGapTTL,
+		LiveSink:       liveSink,
+		Registry:       registry,
+	})
 
 	h := api.NewHandler(api.Deps{
 		Ingester:       ingestion.NewService(repo),
 		Reader:         repo,
 		Replayer:       replayEngine,
 		Original:       origRunner,
+		Processor:      proc,
+		Inspector:      ordMgr,
 		Pinger:         repo,
 		Logger:         logger,
 		RequestTimeout: cfg.RequestTimeout,
