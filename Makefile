@@ -1,10 +1,13 @@
 DATABASE_URL ?= postgres://replay:replay@localhost:5432/replay?sslmode=disable
 export DATABASE_URL
 
-.PHONY: run build test test-integration vet migrate-up migrate-down up down
+.PHONY: run build test test-integration bench vet migrate-up migrate-down up up-postgres down
 
 up:
-	docker compose up -d --wait
+	docker compose up -d --build
+
+up-postgres:
+	docker compose up -d --wait postgres
 
 down:
 	docker compose down
@@ -27,6 +30,9 @@ vet:
 test:
 	go test ./...
 
-# Requires a running PostgreSQL (make up). Uses TEST_DATABASE_URL, defaulting to DATABASE_URL.
+bench:
+	go test -run=NONE -bench=Benchmark -benchmem -count=3 ./internal/ingestion ./internal/replay
+
+# Requires a running PostgreSQL (make up-postgres). Uses TEST_DATABASE_URL, defaulting to DATABASE_URL.
 test-integration:
 	TEST_DATABASE_URL=$(DATABASE_URL) go test -race -count=1 ./...

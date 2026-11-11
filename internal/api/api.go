@@ -16,6 +16,7 @@ import (
 	"github.com/Yagna123k/causal-replay-lab/internal/execution"
 	"github.com/Yagna123k/causal-replay-lab/internal/idempotency"
 	"github.com/Yagna123k/causal-replay-lab/internal/ingestion"
+	"github.com/Yagna123k/causal-replay-lab/internal/observability"
 	"github.com/Yagna123k/causal-replay-lab/internal/ordering"
 	"github.com/Yagna123k/causal-replay-lab/internal/processing"
 	"github.com/Yagna123k/causal-replay-lab/internal/replay"
@@ -70,6 +71,12 @@ type RecoveryCoordinator interface {
 	DetectOrphanedSessions(ctx context.Context, now time.Time) ([]execution.Session, error)
 }
 
+// DebuggingReader provides timeline and failure-inspection views.
+type DebuggingReader interface {
+	GetTransactionTimeline(ctx context.Context, transactionID string) (execution.TransactionTimeline, error)
+	GetReplayFailures(ctx context.Context, sessionID string) (execution.ReplayFailuresReport, error)
+}
+
 // Pinger checks dependency health.
 type Pinger interface {
 	Ping(ctx context.Context) error
@@ -84,10 +91,13 @@ type Deps struct {
 	Processor      EventProcessor
 	Inspector      OrderingInspector
 	Recovery       RecoveryCoordinator
+	Debugger       DebuggingReader
+	Metrics        *observability.Metrics
 	Pinger         Pinger
 	Logger         *slog.Logger
 	RequestTimeout time.Duration
 	MaxBodyBytes   int64
+	APIKey         string
 }
 
 const (
@@ -108,16 +118,22 @@ func NewHandler(d Deps) http.Handler {
 	if d.RequestTimeout <= 0 {
 		d.RequestTimeout = 10 * time.Second
 	}
+	if d.Metrics == nil {
+		d.Metrics = observability.NewMetrics()
+	}
 	s := &server{d}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.HandleFunc("GET /readyz", s.readyz)
+	mux.HandleFunc("GET /metrics", s.metricsHandler)
 	mux.HandleFunc("POST /api/v1/events", s.ingestEvent)
 	mux.HandleFunc("GET /api/v1/events/{id}", s.getEvent)
 	mux.HandleFunc("POST /api/v1/events/{id}/process", s.processEvent)
+	mux.HandleFunc("GET /api/v1/transactions/{id}", s.getTransactionStatus)
 	mux.HandleFunc("GET /api/v1/transactions/{id}/events", s.listTransactionEvents)
 	mux.HandleFunc("GET /api/v1/transactions/{id}/status", s.getTransactionStatus)
+	mux.HandleFunc("GET /api/v1/transactions/{id}/timeline", s.getTransactionTimeline)
 	mux.HandleFunc("POST /api/v1/transactions/{id}/process", s.processOriginal)
 	mux.HandleFunc("POST /api/v1/transactions/{id}/process-events", s.processTransactionEvents)
 	mux.HandleFunc("POST /api/v1/replays", s.createReplay)
@@ -126,6 +142,7 @@ func NewHandler(d Deps) http.Handler {
 	mux.HandleFunc("POST /api/v1/replays/{id}/pause", s.pauseReplay)
 	mux.HandleFunc("GET /api/v1/replays/{id}", s.getReplay)
 	mux.HandleFunc("GET /api/v1/replays/{id}/executions", s.listReplayExecutions)
+	mux.HandleFunc("GET /api/v1/replays/{id}/failures", s.getReplayFailures)
 	mux.HandleFunc("GET /api/v1/replays/{id}/checkpoints", s.listReplayCheckpoints)
 	mux.HandleFunc("GET /api/v1/replays/{id}/attempts", s.listReplayAttempts)
 	mux.HandleFunc("POST /api/v1/replay-recovery/orphans", s.recoverOrphans)
@@ -137,13 +154,20 @@ func NewHandler(d Deps) http.Handler {
 	return chain(mux,
 		requestID,
 		recoverer(d.Logger),
-		accessLog(d.Logger),
+		accessLog(d.Logger, d.Metrics),
+		apiKeyAuth(d.APIKey),
 		timeout(d.RequestTimeout),
 	)
 }
 
 func (s *server) healthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *server) metricsHandler(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	s.Metrics.WritePrometheus(w)
 }
 
 func (s *server) readyz(w http.ResponseWriter, r *http.Request) {
@@ -169,11 +193,16 @@ func (s *server) ingestEvent(w http.ResponseWriter, r *http.Request) {
 	if !s.decodeBody(w, r, &req) {
 		return
 	}
-	res, err := s.Ingester.Ingest(r.Context(), req)
+	ctx := observability.WithCorrelation(r.Context(), observability.Correlation{
+		TransactionID: req.TransactionID,
+		EventID:       req.EventID,
+	})
+	res, err := s.Ingester.Ingest(ctx, req)
 	if err != nil {
 		s.handleError(w, r, err)
 		return
 	}
+	s.Metrics.IncIngested(res.Duplicate)
 	status := http.StatusCreated
 	if res.Duplicate {
 		status = http.StatusOK
@@ -281,10 +310,23 @@ func (s *server) processEvent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	out, err := s.Processor.ProcessEvent(r.Context(), r.PathValue("id"), key, policy)
+	out, err := s.Processor.ProcessEvent(
+		observability.WithCorrelation(r.Context(), observability.Correlation{EventID: r.PathValue("id")}),
+		r.PathValue("id"), key, policy,
+	)
 	if err != nil {
+		if errors.Is(err, ordering.ErrOutOfOrder) || errors.Is(err, ordering.ErrSequenceGapFlagged) {
+			s.Metrics.IncGap()
+		}
 		s.handleError(w, r, err)
 		return
+	}
+	if out.Duplicate {
+		s.Metrics.IncDuplicate("processing")
+	}
+	s.Metrics.IncProcessed(string(out.Status))
+	if out.Buffered {
+		s.Metrics.IncGap()
 	}
 	status := http.StatusOK
 	if out.Buffered {
@@ -331,6 +373,32 @@ func (s *server) getTransactionStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, st)
 }
 
+func (s *server) getTransactionTimeline(w http.ResponseWriter, r *http.Request) {
+	if s.Debugger == nil {
+		writeError(w, http.StatusNotImplemented, "not_configured", "debugging reader is not configured", nil)
+		return
+	}
+	tl, err := s.Debugger.GetTransactionTimeline(r.Context(), r.PathValue("id"))
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, tl)
+}
+
+func (s *server) getReplayFailures(w http.ResponseWriter, r *http.Request) {
+	if s.Debugger == nil {
+		writeError(w, http.StatusNotImplemented, "not_configured", "debugging reader is not configured", nil)
+		return
+	}
+	rep, err := s.Debugger.GetReplayFailures(r.Context(), r.PathValue("id"))
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, rep)
+}
+
 func (s *server) processOriginal(w http.ResponseWriter, r *http.Request) {
 	if s.Original == nil {
 		writeError(w, http.StatusNotImplemented, "not_configured", "original processor is not configured", nil)
@@ -366,9 +434,12 @@ func (s *server) createReplay(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) startReplay(w http.ResponseWriter, r *http.Request) {
+	replayID := r.PathValue("id")
+	ctx := observability.WithCorrelation(r.Context(), observability.Correlation{ReplayID: replayID})
+	start := time.Now()
 	if s.Recovery != nil {
 		workerID := r.Header.Get("X-Worker-ID")
-		res, err := s.Recovery.StartWithRecovery(r.Context(), r.PathValue("id"), workerID)
+		res, err := s.Recovery.StartWithRecovery(ctx, replayID, workerID)
 		if err != nil {
 			if res.Session.SessionID == "" ||
 				errors.Is(err, execution.ErrSessionNotFound) ||
@@ -378,6 +449,7 @@ func (s *server) startReplay(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		s.Metrics.ObserveReplay(string(res.Session.Status), time.Since(start))
 		writeJSON(w, http.StatusOK, res)
 		return
 	}
@@ -385,7 +457,7 @@ func (s *server) startReplay(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotImplemented, "not_configured", "replay engine is not configured", nil)
 		return
 	}
-	res, err := s.Replayer.StartSession(r.Context(), r.PathValue("id"))
+	res, err := s.Replayer.StartSession(ctx, replayID)
 	if err != nil {
 		if res.Session.SessionID == "" ||
 			errors.Is(err, execution.ErrSessionNotFound) ||
@@ -394,6 +466,7 @@ func (s *server) startReplay(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	s.Metrics.ObserveReplay(string(res.Session.Status), time.Since(start))
 	writeJSON(w, http.StatusOK, res)
 }
 

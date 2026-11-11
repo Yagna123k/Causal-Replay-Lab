@@ -1,0 +1,288 @@
+openapi: 3.0.3
+info:
+  title: Causal Replay Lab API
+  version: 1.0.0
+  description: Deterministic event ingestion, idempotent processing, replay, recovery, and debugging API.
+servers:
+  - url: http://localhost:8080
+paths:
+  /healthz:
+    get:
+      summary: Liveness check
+      responses:
+        "200":
+          description: Service is alive
+  /readyz:
+    get:
+      summary: Readiness check (verifies PostgreSQL connectivity)
+      responses:
+        "200":
+          description: Service and database are ready
+        "503":
+          description: Database unavailable
+  /metrics:
+    get:
+      summary: Prometheus text-format metrics
+      responses:
+        "200":
+          description: Prometheus metrics exposition
+  /api/v1/events:
+    post:
+      summary: Ingest an immutable event idempotently
+      responses:
+        "201":
+          description: Event stored
+        "200":
+          description: Duplicate event_id with identical payload hash
+        "401":
+          description: Unauthorized (when API_KEY is configured)
+        "409":
+          description: Payload conflict or sequence conflict
+        "422":
+          description: Validation error
+  /api/v1/events/{id}:
+    get:
+      summary: Retrieve an event by ID
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Event found
+        "404":
+          description: Not found
+  /api/v1/events/{id}/process:
+    post:
+      summary: Process an ingested event with idempotency and ordering guarantees
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Processed (or idempotent duplicate)
+        "202":
+          description: Buffered in pending_events awaiting prerequisite sequences
+        "409":
+          description: Idempotency conflict, out-of-order retryable, or sequence gap flagged
+  /api/v1/transactions/{id}:
+    get:
+      summary: Inspect transaction processing state, gaps, and pending events
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Transaction consistency status
+        "404":
+          description: Not found
+  /api/v1/transactions/{id}/status:
+    get:
+      summary: Alias for transaction consistency and gap status
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Transaction consistency status
+  /api/v1/transactions/{id}/events:
+    get:
+      summary: List ordered event history for a transaction
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: after_sequence
+          in: query
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Ordered events
+  /api/v1/transactions/{id}/timeline:
+    get:
+      summary: Merged timeline of events, replay sessions, executions, checkpoints, and retry attempts
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Transaction timeline
+  /api/v1/transactions/{id}/process:
+    post:
+      summary: Execute original baseline workflow with live dependencies
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Original execution baseline session
+  /api/v1/transactions/{id}/process-events:
+    post:
+      summary: Process all unprocessed events of a transaction in order
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Processing outcomes
+  /api/v1/replays:
+    post:
+      summary: Create a replay session
+      responses:
+        "201":
+          description: Replay session created
+  /api/v1/replays/{id}/start:
+    post:
+      summary: Start a replay session with atomic checkpoints and retry policies
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Replay result
+        "409":
+          description: Invalid state transition or session locked
+  /api/v1/replays/{id}/pause:
+    post:
+      summary: Pause a replay session
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Session paused
+  /api/v1/replays/{id}/resume:
+    post:
+      summary: Resume a paused or interrupted replay session from its latest verified checkpoint
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Resumed replay result
+        "409":
+          description: Invalid transition, locked, or corrupt checkpoint
+  /api/v1/replays/{id}:
+    get:
+      summary: Get replay session status
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Session details
+  /api/v1/replays/{id}/executions:
+    get:
+      summary: List per-event executions for a replay session
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Execution records
+  /api/v1/replays/{id}/failures:
+    get:
+      summary: Inspect failed/dead-lettered events with before/after state and attempts
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Failure report
+  /api/v1/replays/{id}/checkpoints:
+    get:
+      summary: List atomic checkpoints recorded during a replay session
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Checkpoints
+  /api/v1/replays/{id}/attempts:
+    get:
+      summary: List all execution attempts (including retries) for a replay session
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Attempt records
+  /api/v1/replay-recovery/orphans:
+    post:
+      summary: Detect expired-lease orphaned sessions and optionally resume them (?resume=true)
+      responses:
+        "200":
+          description: Orphaned and resumed sessions
+  /api/v1/replay-comparisons:
+    get:
+      summary: Compare two sessions (right may be "original")
+      parameters:
+        - name: left
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: right
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Diff summary with first divergent event

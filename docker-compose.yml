@@ -15,5 +15,34 @@ services:
       timeout: 3s
       retries: 20
 
+  migrate:
+    build:
+      context: .
+    entrypoint: ["/app/migrate", "up"]
+    environment:
+      DATABASE_URL: postgres://replay:replay@postgres:5432/replay?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  app:
+    build:
+      context: .
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgres://replay:replay@postgres:5432/replay?sslmode=disable
+      HTTP_ADDR: ":8080"
+      LOG_LEVEL: info
+      LOG_FORMAT: json
+      ORDERING_POLICY: BUFFER
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
 volumes:
   pgdata:
