@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Yagna123k/causal-replay-lab/internal/api"
+	"github.com/Yagna123k/causal-replay-lab/internal/checkpoint"
 	"github.com/Yagna123k/causal-replay-lab/internal/config"
 	"github.com/Yagna123k/causal-replay-lab/internal/db"
 	"github.com/Yagna123k/causal-replay-lab/internal/eventstore"
@@ -75,6 +76,14 @@ func run() error {
 		Registry:       registry,
 	})
 
+	cpMgr := checkpoint.NewManager(pool)
+	retryPol := replay.NewRetryPolicy(cfg.RetryMaxAttempts, cfg.RetryBaseBackoff, cfg.RetryMaxBackoff, 0.25, 42)
+	recMgr := replay.NewRecoveryManager(pool, repo, execStore, cpMgr, replay.RecoveryOptions{
+		LeaseTTL:    cfg.LeaseTTL,
+		RetryPolicy: retryPol,
+		Registry:    registry,
+	})
+
 	h := api.NewHandler(api.Deps{
 		Ingester:       ingestion.NewService(repo),
 		Reader:         repo,
@@ -82,6 +91,7 @@ func run() error {
 		Original:       origRunner,
 		Processor:      proc,
 		Inspector:      ordMgr,
+		Recovery:       recMgr,
 		Pinger:         repo,
 		Logger:         logger,
 		RequestTimeout: cfg.RequestTimeout,

@@ -33,13 +33,29 @@ func TestStateHashDeterministic(t *testing.T) {
 }
 
 func TestCanTransition(t *testing.T) {
-	if !CanTransition(StatusCreated, StatusRunning) {
-		t.Fatal("CREATED -> RUNNING should be allowed")
+	valid := [][2]SessionStatus{
+		{StatusCreated, StatusRunning},
+		{StatusCreated, StatusPaused},
+		{StatusRunning, StatusPaused},
+		{StatusRunning, StatusInterrupted},
+		{StatusRunning, StatusCompleted},
+		{StatusRunning, StatusFailed},
+		{StatusPaused, StatusResuming},
+		{StatusPaused, StatusInterrupted},
+		{StatusInterrupted, StatusResuming},
+		{StatusResuming, StatusRunning},
+		{StatusResuming, StatusCompleted},
+		{StatusResuming, StatusFailed},
 	}
-	if !CanTransition(StatusRunning, StatusCompleted) || !CanTransition(StatusRunning, StatusFailed) {
-		t.Fatal("RUNNING -> COMPLETED/FAILED should be allowed")
+	for _, p := range valid {
+		if !CanTransition(p[0], p[1]) {
+			t.Errorf("%s -> %s should be allowed", p[0], p[1])
+		}
 	}
-	if CanTransition(StatusCreated, StatusCompleted) || CanTransition(StatusCompleted, StatusRunning) || CanTransition(StatusFailed, StatusRunning) {
+	if CanTransition(StatusCreated, StatusCompleted) ||
+		CanTransition(StatusCompleted, StatusRunning) ||
+		CanTransition(StatusFailed, StatusRunning) ||
+		CanTransition(StatusInterrupted, StatusCompleted) {
 		t.Fatal("invalid transition was allowed")
 	}
 }
