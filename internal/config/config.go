@@ -21,6 +21,9 @@ type Config struct {
 	ShutdownTimeout time.Duration
 	DBMaxConns      int32
 	MaxBodyBytes    int64
+	OrderingPolicy  string // "BUFFER", "REJECT", or "FAIL_AND_FLAG"
+	IdempotencyTTL  time.Duration
+	PendingGapTTL   time.Duration
 }
 
 // Load reads configuration using os.Getenv.
@@ -68,6 +71,9 @@ func LoadFrom(get func(string) string) (Config, error) {
 		ShutdownTimeout: dur("SHUTDOWN_TIMEOUT", 15*time.Second),
 		DBMaxConns:      int32(integer("DB_MAX_CONNS", 10)),
 		MaxBodyBytes:    integer("MAX_BODY_BYTES", 1<<20),
+		OrderingPolicy:  strings.ToUpper(str("ORDERING_POLICY", "BUFFER")),
+		IdempotencyTTL:  dur("IDEMPOTENCY_TTL", 24*time.Hour),
+		PendingGapTTL:   dur("PENDING_GAP_TTL", time.Hour),
 	}
 
 	if cfg.DatabaseURL == "" {
@@ -75,6 +81,11 @@ func LoadFrom(get func(string) string) (Config, error) {
 	}
 	if cfg.LogFormat != "json" && cfg.LogFormat != "text" {
 		errs = append(errs, fmt.Errorf("LOG_FORMAT: must be json or text, got %q", cfg.LogFormat))
+	}
+	switch cfg.OrderingPolicy {
+	case "BUFFER", "REJECT", "FAIL_AND_FLAG":
+	default:
+		errs = append(errs, fmt.Errorf("ORDERING_POLICY: must be BUFFER, REJECT, or FAIL_AND_FLAG, got %q", cfg.OrderingPolicy))
 	}
 	if err := cfg.LogLevel.UnmarshalText([]byte(str("LOG_LEVEL", "info"))); err != nil {
 		errs = append(errs, fmt.Errorf("LOG_LEVEL: %w", err))

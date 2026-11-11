@@ -49,17 +49,27 @@ func TestMigrationsUpDownUp(t *testing.T) {
 	if done, err := db.MigrateUp(ctx, pool, migrations.FS); err != nil || len(done) != 0 {
 		t.Fatalf("second up should be a no-op: %v %v", done, err)
 	}
-	v, err := db.MigrateDown(ctx, pool, migrations.FS)
-	if err != nil || v != 1 {
-		t.Fatalf("down: %v %v", v, err)
+	reverted := 0
+	for {
+		v, err := db.MigrateDown(ctx, pool, migrations.FS)
+		if err != nil {
+			t.Fatalf("down: %v", err)
+		}
+		if v == 0 {
+			break
+		}
+		reverted++
+	}
+	if reverted == 0 {
+		t.Fatal("expected at least one migration to revert")
 	}
 	var n int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.tables
 		WHERE table_schema = current_schema() AND table_name IN ('events','transactions','event_processing')`).Scan(&n); err != nil || n != 0 {
 		t.Fatalf("tables should be gone: n=%d err=%v", n, err)
 	}
-	if done, err := db.MigrateUp(ctx, pool, migrations.FS); err != nil || len(done) != 1 {
-		t.Fatalf("up again: %v %v", done, err)
+	if done, err := db.MigrateUp(ctx, pool, migrations.FS); err != nil || len(done) != reverted {
+		t.Fatalf("up again: %v %v (want %d)", done, err, reverted)
 	}
 }
 

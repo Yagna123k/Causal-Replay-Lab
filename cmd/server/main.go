@@ -16,7 +16,11 @@ import (
 	"github.com/Yagna123k/causal-replay-lab/internal/config"
 	"github.com/Yagna123k/causal-replay-lab/internal/db"
 	"github.com/Yagna123k/causal-replay-lab/internal/eventstore"
+	"github.com/Yagna123k/causal-replay-lab/internal/execution"
 	"github.com/Yagna123k/causal-replay-lab/internal/ingestion"
+	"github.com/Yagna123k/causal-replay-lab/internal/ordering"
+	"github.com/Yagna123k/causal-replay-lab/internal/processing"
+	"github.com/Yagna123k/causal-replay-lab/internal/replay"
 )
 
 func main() {
@@ -50,9 +54,34 @@ func run() error {
 	defer pool.Close()
 
 	repo := eventstore.NewRepository(pool)
+	execStore := execution.NewStore(pool)
+	registry := replay.DefaultRegistry()
+	liveSink := replay.NewLiveEffectSink(func(_ context.Context, eff execution.Effect) error {
+		logger.Info("live effect emitted", "type", eff.Type, "target", eff.Target, "reference_id", eff.ReferenceID)
+		return nil
+	})
+	replayEngine := replay.NewEngine(repo, execStore, registry)
+	origRunner := replay.NewOriginalRunner(repo, execStore, registry, liveSink)
+	policy, err := ordering.ParsePolicy(cfg.OrderingPolicy)
+	if err != nil {
+		return err
+	}
+	ordMgr := ordering.NewManager(pool)
+	proc := processing.NewProcessor(pool, processing.Options{
+		DefaultPolicy:  policy,
+		IdempotencyTTL: cfg.IdempotencyTTL,
+		PendingGapTTL:  cfg.PendingGapTTL,
+		LiveSink:       liveSink,
+		Registry:       registry,
+	})
+
 	h := api.NewHandler(api.Deps{
 		Ingester:       ingestion.NewService(repo),
 		Reader:         repo,
+		Replayer:       replayEngine,
+		Original:       origRunner,
+		Processor:      proc,
+		Inspector:      ordMgr,
 		Pinger:         repo,
 		Logger:         logger,
 		RequestTimeout: cfg.RequestTimeout,
